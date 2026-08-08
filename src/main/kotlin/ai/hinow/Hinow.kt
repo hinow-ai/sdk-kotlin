@@ -1,218 +1,384 @@
 package ai.hinow
 
-import io.ktor.client.*
-import io.ktor.client.call.*
-import io.ktor.client.engine.cio.*
-import io.ktor.client.plugins.*
-import io.ktor.client.plugins.contentnegotiation.*
-import io.ktor.client.request.*
-import io.ktor.client.request.forms.*
-import io.ktor.client.statement.*
-import io.ktor.http.*
-import io.ktor.serialization.kotlinx.json.*
-import kotlinx.serialization.json.*
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.cio.CIO
+import io.ktor.client.plugins.HttpTimeout
+import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.plugins.defaultRequest
+import io.ktor.client.request.HttpRequestBuilder
+import io.ktor.client.request.forms.MultiPartFormDataContent
+import io.ktor.client.request.forms.formData
+import io.ktor.client.request.header
+import io.ktor.client.request.preparePost
+import io.ktor.client.request.request
+import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsChannel
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.ContentType
+import io.ktor.http.Headers
+import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
+import io.ktor.http.contentType
+import io.ktor.serialization.kotlinx.json.json
+import io.ktor.utils.io.readUTF8Line
+import kotlinx.coroutines.delay
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import java.io.File
+import java.net.URLEncoder
+import kotlin.math.min
+import kotlin.math.pow
 
 /**
- * HINOW AI Client
+ * HINOW AI client.
  *
- * Official Kotlin SDK for the HINOW AI Inference API.
+ * The API speaks the OpenAI protocol, so the shape of these calls is the one
+ * you already know:
+ *
+ * ```
+ * val client = Hinow()  // reads HINOW_API_KEY
+ *
+ * val answer = client.chat.completions.create(
+ *     ChatCompletionRequest(
+ *         model = "hinow/himax",
+ *         messages = listOf(Message.user("Olá!")),
+ *     )
+ * )
+ *
+ * println(answer.choices[0].message.text)
+ * ```
+ *
+ * Close the client when you are done, or use it inside `use { }`.
  */
 class Hinow(
     private val apiKey: String = System.getenv("HINOW_API_KEY") ?: "",
-    private val baseUrl: String = "https://api.hinow.ai",
-    private val timeout: Long = 120_000
-) {
+    private val baseUrl: String = System.getenv("HINOW_BASE_URL") ?: DEFAULT_BASE_URL,
+    private val timeout: Long = DEFAULT_TIMEOUT_MS,
+    private val maxRetries: Int = DEFAULT_MAX_RETRIES,
+) : AutoCloseable {
+
+    companion object {
+        const val VERSION = "2.0.0"
+        const val DEFAULT_BASE_URL = "https://api.hinow.ai"
+        const val DEFAULT_TIMEOUT_MS = 120_000L
+        const val DEFAULT_MAX_RETRIES = 2
+    }
+
     init {
         require(apiKey.isNotEmpty()) {
-            "API key is required. Set HINOW_API_KEY environment variable or pass apiKey parameter."
+            "API key is required. Set the HINOW_API_KEY environment variable, " +
+                "or pass apiKey to the constructor."
         }
     }
 
+    internal val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+        encodeDefaults = false
+        explicitNulls = false
+    }
+
+    private val host = baseUrl.trimEnd('/')
+
     private val httpClient = HttpClient(CIO) {
-        install(ContentNegotiation) {
-            json(Json {
-                ignoreUnknownKeys = true
-                isLenient = true
-            })
-        }
+        // Ktor would throw its own exception on a non-2xx; the SDK reads the
+        // body first so it can raise a typed error with the API's own message.
+        expectSuccess = false
+
+        install(ContentNegotiation) { json(json) }
         install(HttpTimeout) {
             requestTimeoutMillis = timeout
             connectTimeoutMillis = timeout
+            socketTimeoutMillis = timeout
         }
         defaultRequest {
-            header("Authorization", "Bearer $apiKey")
-            header("User-Agent", "hinow-kotlin/1.0.0")
-            contentType(ContentType.Application.Json)
+            header(HttpHeaders.Authorization, "Bearer $apiKey")
+            header(HttpHeaders.Accept, "application/json")
+            header(HttpHeaders.UserAgent, "hinow-kotlin/$VERSION")
         }
     }
 
-    val chat = Chat(this)
-    val images = Images(this)
-    val audio = Audio(this)
-    val video = Video(this)
-    val embeddings = Embeddings(this)
-    val models = Models(this)
+    /** Conversation, streaming, function calling and JSON mode. */
+    val chat = ChatService(this)
 
-    suspend fun getBalance(): JsonObject {
-        return get("/v1/balance")
+    /** Image generation. */
+    val images = ImagesService(this)
+
+    /** Text to speech and speech to text. */
+    val audio = AudioService(this)
+
+    /** Video generation. */
+    val video = VideoService(this)
+
+    /** Vectors for semantic search. */
+    val embeddings = EmbeddingsService(this)
+
+    /** The model catalogue. */
+    val models = ModelsService(this)
+
+    /** Web search and website contact extraction. */
+    val tools = ToolsService(this)
+
+    /** Document upload. */
+    val files = FilesService(this)
+
+    /** Searchable knowledge bases, in the OpenAI shape. */
+    val vectorStores = VectorStoresService(this)
+
+    /** Semantic search over your own documents. */
+    val rag = RagService(this)
+
+    /** Agents that run on the server: assistants, threads, runs. */
+    val beta = BetaService(this)
+
+    /** Credit left on the account, in US dollars. */
+    suspend fun getBalance(): Balance {
+        // The endpoint answers {"data": {...}, "success": true}.
+        val body = requestText(HttpMethod.Get, "/v1/balance")
+        val data = Json.parseToJsonElement(body).jsonObject["data"]
+            ?: throw HinowException("The balance response carried no data.")
+
+        return json.decodeFromJsonElement(Balance.serializer(), data)
     }
 
-    internal suspend fun get(path: String): JsonObject {
-        val response = httpClient.get("$baseUrl$path")
-        return Json.parseToJsonElement(response.bodyAsText()).jsonObject
+    // ---------------------------------------------------------------- HTTP
+
+    internal suspend inline fun <reified T> get(path: String): T =
+        json.decodeFromString(requestText(HttpMethod.Get, path))
+
+    internal suspend inline fun <reified T, reified B> post(path: String, body: B): T =
+        json.decodeFromString(requestText(HttpMethod.Post, path, json.encodeToString(body)))
+
+    internal suspend inline fun <reified T> postEmpty(path: String): T =
+        json.decodeFromString(requestText(HttpMethod.Post, path, "{}"))
+
+    internal suspend inline fun <reified T> delete(path: String): T =
+        json.decodeFromString(requestText(HttpMethod.Delete, path))
+
+    /** Unwrap the `{"data": ..., "success": true}` envelope. */
+    internal suspend inline fun <reified T> getUnwrapped(path: String): T =
+        unwrap(requestText(HttpMethod.Get, path))
+
+    internal suspend inline fun <reified T, reified B> postUnwrapped(path: String, body: B): T =
+        unwrap(requestText(HttpMethod.Post, path, json.encodeToString(body)))
+
+    internal inline fun <reified T> unwrap(body: String): T {
+        val root = Json.parseToJsonElement(body).jsonObject
+        val data = root["data"] ?: return json.decodeFromString(body)
+        return json.decodeFromJsonElement(data)
     }
 
-    internal suspend fun post(path: String, body: JsonObject): JsonObject {
-        val response = httpClient.post("$baseUrl$path") {
-            setBody(body)
-        }
-        return Json.parseToJsonElement(response.bodyAsText()).jsonObject
-    }
+    /**
+     * Send a request, retrying rate limits and 5xx, and hand back the body.
+     */
+    internal suspend fun requestText(
+        method: HttpMethod,
+        path: String,
+        jsonBody: String? = null,
+    ): String {
+        var attempt = 0
 
-    fun close() {
-        httpClient.close()
-    }
-}
-
-class Chat(private val client: Hinow) {
-    fun completions() = ChatCompletions(client)
-}
-
-class ChatCompletions(private val client: Hinow) {
-    suspend fun create(
-        model: String,
-        messages: List<Map<String, Any>>,
-        temperature: Double? = null,
-        maxTokens: Int? = null,
-        topP: Double? = null,
-        tools: List<Map<String, Any>>? = null,
-        toolChoice: Any? = null
-    ): JsonObject {
-        val body = buildJsonObject {
-            put("model", model)
-            putJsonArray("messages") {
-                messages.forEach { msg ->
-                    addJsonObject {
-                        msg.forEach { (k, v) ->
-                            when (v) {
-                                is String -> put(k, v)
-                                is Number -> put(k, v)
-                                else -> put(k, v.toString())
-                            }
-                        }
+        while (true) {
+            val response: HttpResponse = try {
+                httpClient.request("$host$path") {
+                    this.method = method
+                    if (jsonBody != null) {
+                        contentType(ContentType.Application.Json)
+                        setBody(jsonBody)
                     }
                 }
+            } catch (e: Exception) {
+                if (attempt < maxRetries) {
+                    backOff(++attempt, null)
+                    continue
+                }
+                throw ConnectionException("Could not reach the HINOW API: ${e.message}", e)
             }
 
-            val params = buildJsonObject {
-                temperature?.let { put("temperature", it.toString()) }
-                maxTokens?.let { put("max_tokens", it.toString()) }
-                topP?.let { put("top_p", it.toString()) }
-            }
-            if (params.isNotEmpty()) put("parameters", params)
+            val status = response.status.value
 
-            tools?.let {
-                putJsonArray("tools") {
-                    it.forEach { tool -> add(Json.encodeToJsonElement(tool)) }
+            if ((status == 429 || status >= 500) && attempt < maxRetries) {
+                backOff(++attempt, response.headers[HttpHeaders.RetryAfter])
+                continue
+            }
+
+            val text = response.bodyAsText()
+
+            // Any 2xx is a success: creating answers 201 and starting a tool
+            // job answers 202. The old client checked nothing at all, so an
+            // error body came back looking like a result.
+            if (status !in 200..299) {
+                throw errorFor(status, text)
+            }
+
+            return text
+        }
+    }
+
+    /** Upload a form. Rebuilt per attempt, since a body cannot be replayed. */
+    internal suspend inline fun <reified T> postMultipart(
+        path: String,
+        fields: Map<String, String>,
+        fileField: String?,
+        fileName: String?,
+        content: ByteArray?,
+    ): T {
+        var attempt = 0
+
+        while (true) {
+            val response: HttpResponse = try {
+                httpClient.request("$host$path") {
+                    method = HttpMethod.Post
+                    setBody(
+                        MultiPartFormDataContent(
+                            formData {
+                                fields.forEach { (name, value) -> append(name, value) }
+                                if (fileField != null && content != null) {
+                                    append(
+                                        fileField,
+                                        content,
+                                        Headers.build {
+                                            append(
+                                                HttpHeaders.ContentDisposition,
+                                                "filename=\"${fileName ?: "upload.bin"}\"",
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                if (attempt < maxRetries) {
+                    backOff(++attempt, null)
+                    continue
+                }
+                throw ConnectionException("Could not reach the HINOW API: ${e.message}", e)
+            }
+
+            val status = response.status.value
+
+            if ((status == 429 || status >= 500) && attempt < maxRetries) {
+                backOff(++attempt, response.headers[HttpHeaders.RetryAfter])
+                continue
+            }
+
+            val text = response.bodyAsText()
+            if (status !in 200..299) {
+                throw errorFor(status, text)
+            }
+
+            return json.decodeFromString(text)
+        }
+    }
+
+    /** Raw bytes instead of decoded JSON — file downloads use this. */
+    internal suspend fun getBytes(path: String): ByteArray {
+        val response = httpClient.request("$host$path") { method = HttpMethod.Get }
+        val status = response.status.value
+
+        if (status !in 200..299) {
+            throw errorFor(status, response.bodyAsText())
+        }
+
+        return response.bodyAsChannel().let { channel ->
+            val buffer = mutableListOf<Byte>()
+            while (!channel.isClosedForRead) {
+                val chunk = ByteArray(8192)
+                val read = channel.readAvailable(chunk, 0, chunk.size)
+                if (read <= 0) break
+                buffer.addAll(chunk.take(read))
+            }
+            buffer.toByteArray()
+        }
+    }
+
+    /**
+     * Server-sent events, handed to the callback one decoded event at a time.
+     */
+    internal suspend inline fun <reified T> stream(
+        path: String,
+        jsonBody: String,
+        crossinline onEvent: (T) -> Unit,
+    ) {
+        try {
+            httpClient.preparePost("$host$path") {
+                header(HttpHeaders.Accept, "text/event-stream")
+                contentType(ContentType.Application.Json)
+                setBody(jsonBody)
+            }.execute { response ->
+                val status = response.status.value
+                if (status !in 200..299) {
+                    throw errorFor(status, response.bodyAsText())
+                }
+
+                val channel = response.bodyAsChannel()
+                while (!channel.isClosedForRead) {
+                    val line = channel.readUTF8Line() ?: break
+                    val trimmed = line.trim()
+
+                    if (trimmed.isEmpty() || trimmed.startsWith(":")) continue
+                    if (!trimmed.startsWith("data:")) continue
+
+                    val payload = trimmed.removePrefix("data:").trim()
+                    if (payload.isEmpty() || payload == "[DONE]") continue
+
+                    // A malformed event is skipped rather than killing the stream.
+                    val event = try {
+                        json.decodeFromString<T>(payload)
+                    } catch (ignored: Exception) {
+                        null
+                    }
+
+                    if (event != null) onEvent(event)
                 }
             }
-            toolChoice?.let { put("tool_choice", Json.encodeToJsonElement(it)) }
+        } catch (e: HinowException) {
+            throw e
+        } catch (e: Exception) {
+            throw ConnectionException("Could not reach the HINOW API: ${e.message}", e)
         }
+    }
 
-        return client.post("/v1/chat/completions", body)
+    /** Back off, honouring Retry-After when the API sends one. */
+    internal suspend fun backOff(attempt: Int, retryAfter: String?) {
+        val seconds = retryAfter?.toDoubleOrNull() ?: (0.5 * 2.0.pow(attempt - 1))
+        delay((min(seconds, 20.0) * 1000).toLong())
+    }
+
+    override fun close() {
+        httpClient.close()
+    }
+
+    internal fun buildQuery(params: Map<String, Any?>): String {
+        val pieces = params.entries
+            .filter { it.value != null }
+            .joinToString("&") { "${it.key}=${encodeSegment(it.value.toString())}" }
+
+        return if (pieces.isEmpty()) "" else "?$pieces"
     }
 }
 
-class Images(private val client: Hinow) {
-    suspend fun generate(
-        model: String,
-        prompt: String,
-        n: Int? = null,
-        size: String? = null,
-        quality: String? = null,
-        style: String? = null
-    ): JsonObject {
-        val body = buildJsonObject {
-            put("model", model)
-            put("prompt", prompt)
+/**
+ * Escape each path segment on its own. Model ids carry a namespace —
+ * `hinow/himax` — and escaping the slash makes the API answer 404.
+ */
+internal fun encodePath(value: String): String =
+    value.split("/").joinToString("/") { encodeSegment(it) }
 
-            val params = buildJsonObject {
-                n?.let { put("n", it.toString()) }
-                size?.let { put("size", it) }
-                quality?.let { put("quality", it) }
-                style?.let { put("style", it) }
-            }
-            if (params.isNotEmpty()) put("parameters", params)
-        }
+internal fun encodeSegment(value: String): String =
+    URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
-        return client.post("/v1/images", body)
+/** Read a file into memory, with a message that names the path when it fails. */
+internal fun readFileOrThrow(path: String): ByteArray {
+    val file = File(path)
+    if (!file.canRead()) {
+        throw HinowException("Cannot read file: $path")
     }
-}
-
-class Audio(private val client: Hinow) {
-    suspend fun speech(
-        model: String,
-        input: String,
-        voice: String? = null,
-        speed: Double? = null
-    ): JsonObject {
-        val body = buildJsonObject {
-            put("model", model)
-            put("prompt", input) // API uses "prompt" not "input"
-
-            val params = buildJsonObject {
-                voice?.let { put("voice", it) }
-                speed?.let { put("speed", it.toString()) }
-            }
-            if (params.isNotEmpty()) put("parameters", params)
-        }
-
-        return client.post("/v1/audio/speech", body)
-    }
-}
-
-class Video(private val client: Hinow) {
-    suspend fun generate(
-        model: String,
-        prompt: String,
-        duration: Int? = null,
-        resolution: String? = null,
-        fps: Int? = null
-    ): JsonObject {
-        val body = buildJsonObject {
-            put("model", model)
-            put("prompt", prompt)
-
-            val params = buildJsonObject {
-                duration?.let { put("duration", it.toString()) }
-                resolution?.let { put("resolution", it) }
-                fps?.let { put("fps", it.toString()) }
-            }
-            if (params.isNotEmpty()) put("parameters", params)
-        }
-
-        return client.post("/v1/videos", body)
-    }
-}
-
-class Embeddings(private val client: Hinow) {
-    suspend fun create(model: String, input: Any): JsonObject {
-        val body = buildJsonObject {
-            put("model", model)
-            when (input) {
-                is String -> put("input", input)
-                is List<*> -> putJsonArray("input") {
-                    input.filterIsInstance<String>().forEach { add(it) }
-                }
-            }
-        }
-
-        return client.post("/v1/embeddings", body)
-    }
-}
-
-class Models(private val client: Hinow) {
-    suspend fun list(): JsonObject {
-        return client.get("/v1/models")
-    }
+    return file.readBytes()
 }
