@@ -1,0 +1,9 @@
+# O JitPack usa Gradle 6.7.1 e um JDK antigo por padrão, e o plugin Kotlin 1.9
+# exige Gradle 6.8.3 ou mais novo — o build v2.0.0 falhou exatamente por isso.
+# O wrapper versionado resolve a versão do Gradle; esta linha resolve o JDK.
+jdk:
+  - openjdk17
+
+before_install:
+  - sdk install java 17.0.10-open
+  - sdk use java 17.0.10-open

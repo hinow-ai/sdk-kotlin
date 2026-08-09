@@ -1,3 +1,7 @@
 build/
 .gradle/
 *.class
+
+# O wrapper é versionado de propósito — o JitPack depende dele.
+!gradle/wrapper/
+!gradlew
