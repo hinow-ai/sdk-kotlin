@@ -22,7 +22,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.github.hinow-ai:sdk-kotlin:v2.0.0")
+    implementation("com.github.hinow-ai:sdk-kotlin:v2.0.2")
 }
 ```
 
