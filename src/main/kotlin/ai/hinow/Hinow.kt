@@ -62,7 +62,7 @@ class Hinow(
 ) : AutoCloseable {
 
     companion object {
-        const val VERSION = "2.0.1"
+        const val VERSION = "2.0.2"
         const val DEFAULT_BASE_URL = "https://api.hinow.ai"
         const val DEFAULT_TIMEOUT_MS = 120_000L
         const val DEFAULT_MAX_RETRIES = 2
